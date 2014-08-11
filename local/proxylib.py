@@ -1085,7 +1085,7 @@ class MIMTProxyHandlerFilter(BaseProxyHandlerFilter):
             return 'direct', {}
 
 class JumpLastFilter(BaseProxyHandlerFilter):
-    """with gae filter"""
+    """jumplast(aka withgae) filter"""
     def __init__(self, jumplast_sites):
         self.jumplast_sites = set(jumplast_sites)
 
@@ -1202,20 +1202,74 @@ class FakeHttpsFilter(BaseProxyHandlerFilter):
             return 'strip', {}
 
 
+class CRLFSitesFilter(BaseProxyHandlerFilter):
+    """crlf sites filter"""
+    def __init__(self, crlf_sites, nocrlf_sites):
+        self.crlf_sites = tuple(crlf_sites)
+        self.nocrlf_sites = set(nocrlf_sites)
+
+    def filter(self, handler):
+        if handler.command != 'CONNECT' and handler.scheme != 'https':
+            if handler.host.endswith(self.crlf_sites) and handler.host not in self.nocrlf_sites:
+                logging.debug('CRLFSitesFilter metched %r %r', handler.path, handler.headers)
+                handler.close_connection = True
+                return 'direct', {'crlf': True}
+
+
 class URLRewriteFilter(BaseProxyHandlerFilter):
     """url rewrite filter"""
-    rules = {
-                'www.google.com': (r'^https?://www\.google\.com/(?:imgres|url)\?.*url=([^&]+)', lambda m: urllib.unquote_plus(m.group(1))),
-                'www.google.com.hk': (r'^https?://www\.google\.com\.hk/url\?.*url=([^&]+)', lambda m: urllib.unquote_plus(m.group(1))),
-            }
+    def __init__(self, urlrewrite_map):
+        self.urlrewrite_map = {}
+        for regex, repl in urlrewrite_map.items():
+            mo = re.search(r'://([^/:]+)', regex)
+            if not mo:
+                logging.warning('URLRewriteFilter does not support regex: %r', regex)
+                continue
+            addr = mo.group(1).replace(r'\.', '.')
+            mo = re.match(r'[\w\-\_\d\[\]\:]+', addr)
+            if not mo:
+                logging.warning('URLRewriteFilter does not support wildcard host: %r', addr)
+            self.urlrewrite_map.setdefault(addr, []).append((re.compile(regex).search, repl))
+
     def filter(self, handler):
-        if handler.host in self.rules:
-            pattern, callback = self.rules[handler.host]
-            m = re.search(pattern, handler.path)
-            if m:
+        if handler.host not in self.urlrewrite_map:
+            return
+        for match, repl in self.urlrewrite_map[handler.host]:
+            mo = match(handler.path)
+            if mo:
                 logging.debug('URLRewriteFilter metched %r', handler.path)
-                headers = {'Location': callback(m), 'Connection': 'close'}
-                return 'mock', {'status': 301, 'headers': headers, 'body': ''}
+                if repl.startswith('file://'):
+                    return self.filter_localfile(handler, mo, repl)
+                else:
+                    return self.filter_redirect(handler, mo, repl)
+
+    def filter_redirect(self, handler, mo, repl):
+        for i, g in enumerate(mo.groups()):
+            repl = repl.replace('$%d' % (i+1), urllib.unquote_plus(g))
+        headers = {'Location': repl, 'Connection': 'close'}
+        return 'mock', {'status': 301, 'headers': headers, 'body': ''}
+
+    def filter_localfile(self, handler, mo, repl):
+        filename = repl.lstrip('file://')
+        if filename.lower() in ('/dev/null', 'nul'):
+            filename = os.devnull
+        if os.name == 'nt':
+            filename = filename.lstrip('/')
+        content_type = None
+        try:
+            import mimetypes
+            content_type = mimetypes.types_map.get(os.path.splitext(filename)[1])
+        except StandardError as e:
+            logging.error('import mimetypes failed: %r', e)
+        try:
+            with open(filename, 'rb') as fp:
+                data = fp.read()
+                headers = {'Connection': 'close', 'Content-Length': str(len(data))}
+                if content_type:
+                    headers['Content-Type'] = content_type
+                return 'mock', {'status': 200, 'headers': headers, 'body': data}
+        except StandardError as e:
+            return 'mock', {'status': 403, 'headers': {'Connection': 'close'}, 'body': 'read %r %r' % (filename, e)}
 
 
 class AutoRangeFilter(BaseProxyHandlerFilter):
@@ -1455,17 +1509,20 @@ class MultipleConnectionMixin(object):
     dns_blacklist = []
     tcp_connection_time = collections.defaultdict(float)
     tcp_connection_time_with_clienthello = collections.defaultdict(float)
-    tcp_connection_cache = collections.defaultdict(Queue.PriorityQueue)
     ssl_connection_time = collections.defaultdict(float)
-    ssl_connection_cache = collections.defaultdict(Queue.PriorityQueue)
     ssl_connection_good_ipaddrs = {}
     ssl_connection_bad_ipaddrs = {}
     ssl_connection_unknown_ipaddrs = {}
+    tcp_connection_cachesock = False
+    tcp_connection_keepalive = False
+    ssl_connection_cachesock = False
+    ssl_connection_keepalive = False
+    tcp_connection_cache = collections.defaultdict(Queue.PriorityQueue)
+    ssl_connection_cache = collections.defaultdict(Queue.PriorityQueue)
     max_window = 4
     connect_timeout = 4
     max_timeout = 8
     ssl_version = ssl.PROTOCOL_TLSv1
-    ssl_connection_keepalive = False
     openssl_context = OpenSSL.SSL.Context(OpenSSL.SSL.TLSv1_METHOD)
 
     def gethostbyname2(self, hostname):
@@ -1487,7 +1544,7 @@ class MultipleConnectionMixin(object):
 
     def create_tcp_connection(self, hostname, port, timeout, **kwargs):
         client_hello = kwargs.get('client_hello', None)
-        cache_key = kwargs.get('cache_key') if not client_hello else None
+        cache_key = kwargs.get('cache_key', '') if self.tcp_connection_cachesock and not client_hello else ''
         def create_connection(ipaddr, timeout, queobj):
             sock = None
             try:
@@ -1587,7 +1644,7 @@ class MultipleConnectionMixin(object):
             raise sock
 
     def create_ssl_connection(self, hostname, port, timeout, **kwargs):
-        cache_key = kwargs.get('cache_key', '')
+        cache_key = kwargs.get('cache_key', '') if self.ssl_connection_cachesock else ''
         validate = kwargs.get('validate')
         def create_connection(ipaddr, timeout, queobj):
             sock = None
@@ -1745,7 +1802,7 @@ class MultipleConnectionMixin(object):
         def reorg_ipaddrs():
             current_time = time.time()
             for ipaddr, ctime in self.ssl_connection_good_ipaddrs.items():
-                if current_time - ctime > 4 * 60:
+                if current_time - ctime > 4 * 60 and len(self.ssl_connection_good_ipaddrs) > 2 * self.max_window:
                     self.ssl_connection_good_ipaddrs.pop(ipaddr, None)
                     self.ssl_connection_unknown_ipaddrs[ipaddr] = ctime
             for ipaddr, ctime in self.ssl_connection_bad_ipaddrs.items():
@@ -1763,6 +1820,7 @@ class MultipleConnectionMixin(object):
         except Queue.Empty:
             pass
         addresses = [(x, port) for x in self.gethostbyname2(hostname)]
+        #logging.info('gethostbyname2(%r) return %d addresses', hostname, len(addresses))
         sock = None
         for i in range(kwargs.get('max_retry', 5)):
             reorg_ipaddrs()
@@ -1882,7 +1940,7 @@ class MultipleConnectionMixin(object):
             response.fp = sock.makefile('rb')
         sock.settimeout(self.connect_timeout)
         response.begin()
-        if self.ssl_connection_keepalive and scheme == 'https' and cache_key:
+        if ((scheme == 'https' and self.ssl_connection_cachesock and self.ssl_connection_keepalive) or (scheme == 'http' and self.tcp_connection_cachesock and self.tcp_connection_keepalive)) and cache_key:
             response.cache_key = cache_key
             response.cache_sock = response.fp._sock
         return response
